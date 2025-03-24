@@ -1,0 +1,64 @@
+# Ensure the GroupPolicy module is imported
+Import-Module GroupPolicy
+
+function Check-DefenderSettingsAndSave {
+    [CmdletBinding()]
+    param (
+        [string]$OutputFilePath = ".\GPOsWithDefenderSettings.txt"
+    )
+
+    # List all GPOs
+    $allGPOs = Get-GPO -All
+
+    if (-not $allGPOs) {
+        Write-Host "No GPOs found in the domain." -ForegroundColor Yellow
+        return
+    }
+
+    # Define registry keys to check for Defender and Firewall settings
+    $defenderRegistryKeys = @(
+        "HKLM\Software\Policies\Microsoft\Windows Defender",
+        "HKLM\Software\Policies\Microsoft\Windows Defender Firewall"
+    )
+
+    # Create a list to store GPO names with relevant settings
+    $gposWithSettings = @()
+
+    # Process each GPO
+    foreach ($gpo in $allGPOs) {
+        Write-Host "Checking GPO: $($gpo.DisplayName)" -ForegroundColor Cyan
+        $settingsPresent = $false
+
+        foreach ($key in $defenderRegistryKeys) {
+            try {
+                $registryValues = Get-GPRegistryValue -Guid $gpo.Id -Key $key -ErrorAction Stop
+                if ($registryValues) {
+                    $settingsPresent = $true
+                    Write-Host "  Found settings for: $key" -ForegroundColor Green
+                }
+            } catch {
+                Write-Host "  No settings found for: $key" -ForegroundColor Yellow
+            }
+        }
+
+        if ($settingsPresent) {
+            Write-Host "  Relevant Defender or Firewall settings found." -ForegroundColor Green
+            $gposWithSettings += $gpo.DisplayName
+        } else {
+            Write-Host "  No Defender or Firewall settings found." -ForegroundColor Red
+        }
+    }
+
+    # Save the GPO names with settings to a file
+    if ($gposWithSettings.Count -gt 0) {
+        $gposWithSettings | Out-File -FilePath $OutputFilePath -Encoding UTF8
+        Write-Host "List of GPOs with Defender settings saved to $OutputFilePath" -ForegroundColor Green
+    } else {
+        Write-Host "No GPOs with Defender or Firewall settings were found." -ForegroundColor Red
+    }
+}
+
+# Main code section to call the function
+Write-Host "Starting the process to check GPOs for Defender settings..." -ForegroundColor Cyan
+Check-DefenderSettingsAndSave -OutputFilePath ".\DefenderSettingsGPOs.txt"
+Write-Host "Process completed!" -ForegroundColor Cyan
