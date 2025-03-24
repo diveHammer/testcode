@@ -4,7 +4,7 @@ Import-Module GroupPolicy
 function Check-DefenderSettingsAndSave {
     [CmdletBinding()]
     param (
-        [string]$OutputFilePath = ".\GPOsWithDefenderSettings.txt"
+        [string]$OutputFilePath = "C:\temp\reports\GPOsWithDefenderSettings.csv"
     )
 
     # List all GPOs
@@ -21,8 +21,8 @@ function Check-DefenderSettingsAndSave {
         "HKLM\Software\Policies\Microsoft\Windows Defender Firewall"
     )
 
-    # Create a list to store GPO names with relevant settings
-    $gposWithSettings = @()
+    # Create a list to store GPOs with relevant information
+    $gpoData = @()
 
     # Process each GPO
     foreach ($gpo in $allGPOs) {
@@ -41,17 +41,16 @@ function Check-DefenderSettingsAndSave {
             }
         }
 
-        if ($settingsPresent) {
-            Write-Host "  Relevant Defender or Firewall settings found." -ForegroundColor Green
-            $gposWithSettings += $gpo.DisplayName
-        } else {
-            Write-Host "  No Defender or Firewall settings found." -ForegroundColor Red
+        # Store the result in an object
+        $gpoData += [PSCustomObject]@{
+            GPOName           = $gpo.DisplayName
+            SettingsDetected  = if ($settingsPresent) { "Yes" } else { "No" }
         }
     }
 
-    # Save the GPO names with settings to a file
-    if ($gposWithSettings.Count -gt 0) {
-        $gposWithSettings | Out-File -FilePath $OutputFilePath -Encoding UTF8
+    # Save the GPO data to a CSV file
+    if ($gpoData.Count -gt 0) {
+        $gpoData | Export-Csv -Path $OutputFilePath -NoTypeInformation -Encoding UTF8
         Write-Host "List of GPOs with Defender settings saved to $OutputFilePath" -ForegroundColor Green
     } else {
         Write-Host "No GPOs with Defender or Firewall settings were found." -ForegroundColor Red
@@ -60,5 +59,5 @@ function Check-DefenderSettingsAndSave {
 
 # Main code section to call the function
 Write-Host "Starting the process to check GPOs for Defender settings..." -ForegroundColor Cyan
-Check-DefenderSettingsAndSave -OutputFilePath ".\DefenderSettingsGPOs.txt"
+Check-DefenderSettingsAndSave -OutputFilePath "C:\temp\reports\GPOsWithDefenderSettings.csv"
 Write-Host "Process completed!" -ForegroundColor Cyan
