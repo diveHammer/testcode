@@ -1,10 +1,14 @@
+# Import the Group Policy module
 Import-Module GroupPolicy
 
-# Define the output file path
-$outputFile = "C:\Temp\GPO_DefenderFirewall_Settings.csv"
+# Get the current date and time stamp
+$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+
+# Define the output file path with date-time stamp
+$outputFile = "C:\Temp\GPO_Defender_Settings_$timestamp.csv"
 
 # Create the output file and add headers
-"Policy Name,Has Firewall Settings" | Out-File $outputFile
+"Policy Name,Setting Type,Profile,Is Enabled" | Out-File $outputFile
 
 # Get all GPOs in the domain
 $GPOs = Get-GPO -All
@@ -13,12 +17,50 @@ foreach ($GPO in $GPOs) {
     # Display the GPO name on the screen
     Write-Host "Checking GPO: $($GPO.DisplayName)"
 
-    # Check if the GPO contains Defender Firewall settings
-    $GPOReport = Get-GPOReport -Guid $GPO.Id -ReportType XML
-    $hasFirewallSettings = $GPOReport -match "Firewall"
+    # Generate XML report for the GPO
+    $GPOReport = [xml](Get-GPOReport -Guid $GPO.Id -ReportType XML)
 
-    # Save results to the CSV file
-    $result = "$($GPO.DisplayName),$($hasFirewallSettings)"
+    # Define Firewall profiles to check
+    $firewallProfiles = @("DomainProfile", "PrivateProfile", "PublicProfile")
+
+    foreach ($profile in $firewallProfiles) {
+        # Search for Defender Firewall settings
+        $firewallSetting = $GPOReport.GPO.Policies.Policy | Where-Object {
+            $_.Attributes.name -eq "$profile: Windows Defender Firewall"
+        }
+
+        # Check if the Firewall setting exists and is enabled
+        if ($firewallSetting) {
+            $isEnabled = $firewallSetting.Attributes.Value -eq "1" ? "Enabled" : "Disabled"
+        } else {
+            $isEnabled = "Not Configured"
+        }
+
+        # Display Firewall results on the screen
+        Write-Host "$($GPO.DisplayName) - Defender Firewall ($profile): $isEnabled"
+
+        # Save Firewall results to the CSV file
+        $result = "$($GPO.DisplayName),Defender Firewall,$profile,$isEnabled"
+        $result | Out-File $outputFile -Append
+    }
+
+    # Search for Defender Antivirus settings
+    $antivirusSetting = $GPOReport.GPO.Policies.Policy | Where-Object {
+        $_.Attributes.name -match "Defender Antivirus"
+    }
+
+    # Check if the Antivirus setting exists and is enabled
+    if ($antivirusSetting) {
+        $isEnabled = $antivirusSetting.Attributes.Value -eq "1" ? "Enabled" : "Disabled"
+    } else {
+        $isEnabled = "Not Configured"
+    }
+
+    # Display Antivirus results on the screen
+    Write-Host "$($GPO.DisplayName) - Defender Antivirus: $isEnabled"
+
+    # Save Antivirus results to the CSV file
+    $result = "$($GPO.DisplayName),Defender Antivirus,Global,$isEnabled"
     $result | Out-File $outputFile -Append
 }
 
