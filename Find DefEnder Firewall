@@ -1,0 +1,25 @@
+Import-Module GroupPolicy
+
+# Define the output file path
+$outputFile = "C:\Temp\GPO_DefenderFirewall_Settings.csv"
+
+# Create the output file and add headers
+"Policy Name,Has Firewall Settings" | Out-File $outputFile
+
+# Get all GPOs in the domain
+$GPOs = Get-GPO -All
+
+foreach ($GPO in $GPOs) {
+    # Display the GPO name on the screen
+    Write-Host "Checking GPO: $($GPO.DisplayName)"
+
+    # Check if the GPO contains Defender Firewall settings
+    $GPOReport = Get-GPOReport -Guid $GPO.Id -ReportType XML
+    $hasFirewallSettings = $GPOReport -match "Firewall"
+
+    # Save results to the CSV file
+    $result = "$($GPO.DisplayName),$($hasFirewallSettings)"
+    $result | Out-File $outputFile -Append
+}
+
+Write-Host "Results saved to $outputFile"
