@@ -1,0 +1,44 @@
+# Import the Active Directory module
+Import-Module ActiveDirectory
+
+# Define settings to search for
+$settings = @("Windows Defender Firewall", "Windows Defender Antivirus")
+
+# Initialize an array to store results
+$results = @()
+
+# Get all GPOs in the domain and sort alphabetically
+$GPOs = Get-Gpo -All | Sort-Object -Property DisplayName
+
+foreach ($GPO in $GPOs) {
+    Write-Host "Checking GPO: $($GPO.DisplayName)" -ForegroundColor Yellow
+    
+    # Retrieve the GPO report as XML
+    $GPOContent = Get-GpoReport -Guid $GPO.Id -ReportType Xml
+    $xmlContent = [xml]$GPOContent
+    
+    # Initialize a flag for findings
+    $found = $false
+    
+    # Search for settings in specific nodes or attributes
+    foreach ($setting in $settings) {
+        if ($xmlContent.InnerXml -like "*$setting*") {
+            $found = $true
+            Write-Host "Found setting: $setting in GPO: $($GPO.DisplayName)" -ForegroundColor Green
+        }
+    }
+    
+    # Add GPOs with the settings found to the results
+    if ($found) {
+        $results += [PSCustomObject]@{
+            GPOName  = $GPO.DisplayName
+            Setting1 = $settings[0]
+            Setting2 = $settings[1]
+        }
+    }
+}
+
+# Export results to CSV
+$results | Export-Csv -Path "GPO_Settings_Report.csv" -NoTypeInformation
+
+Write-Host "Report generated: GPO_Settings_Report.csv" -ForegroundColor Cyan
