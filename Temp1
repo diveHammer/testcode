@@ -4,37 +4,48 @@ Import-Module ActiveDirectory
 # Define settings to search for
 $settings = @("Windows Defender Firewall", "Windows Defender Antivirus")
 
+# Prompt the user for the path to the CSV file
+$CSVPath = Read-Host "Enter the path to the CSV file (e.g., C:\GPOs.csv)"
+
+# Read the CSV file and extract the GPO names
+$GPOsFromCSV = Import-Csv -Path $CSVPath
+
 # Initialize an array to store results
 $results = @()
 
-# Get all GPOs in the domain and sort alphabetically
-$GPOs = Get-Gpo -All | Sort-Object -Property DisplayName
+foreach ($row in $GPOsFromCSV) {
+    $GPOName = $row.GPOName
+    Write-Host "Checking GPO: $GPOName" -ForegroundColor Yellow
+    
+    # Retrieve the GPO
+    $GPO = Get-Gpo -Name $GPOName -ErrorAction SilentlyContinue
+    
+    if ($GPO -ne $null) {
+        # Retrieve the GPO report as XML
+        $GPOContent = Get-GpoReport -Guid $GPO.Id -ReportType Xml
+        $xmlContent = [xml]$GPOContent
+        
+        # Initialize a flag for findings
+        $found = $false
 
-foreach ($GPO in $GPOs) {
-    Write-Host "Checking GPO: $($GPO.DisplayName)" -ForegroundColor Yellow
-    
-    # Retrieve the GPO report as XML
-    $GPOContent = Get-GpoReport -Guid $GPO.Id -ReportType Xml
-    $xmlContent = [xml]$GPOContent
-    
-    # Initialize a flag for findings
-    $found = $false
-    
-    # Search for settings in specific nodes or attributes
-    foreach ($setting in $settings) {
-        if ($xmlContent.InnerXml -like "*$setting*") {
-            $found = $true
-            Write-Host "Found setting: $setting in GPO: $($GPO.DisplayName)" -ForegroundColor Green
+        # Search for settings in specific nodes or attributes
+        foreach ($setting in $settings) {
+            if ($xmlContent.InnerXml -like "*$setting*") {
+                $found = $true
+                Write-Host "Found setting: $setting in GPO: $GPOName" -ForegroundColor Green
+            }
         }
-    }
-    
-    # Add GPOs with the settings found to the results
-    if ($found) {
-        $results += [PSCustomObject]@{
-            GPOName  = $GPO.DisplayName
-            Setting1 = $settings[0]
-            Setting2 = $settings[1]
+        
+        # Add GPOs with the settings found to the results
+        if ($found) {
+            $results += [PSCustomObject]@{
+                GPOName  = $GPOName
+                Setting1 = $settings[0]
+                Setting2 = $settings[1]
+            }
         }
+    } else {
+        Write-Host "GPO '$GPOName' not found in the domain. Please check the name and try again." -ForegroundColor Red
     }
 }
 
