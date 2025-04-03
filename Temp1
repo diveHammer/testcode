@@ -1,17 +1,17 @@
 # Import the Active Directory module
 Import-Module ActiveDirectory
 
-# Define settings to search for
-$settings = @("Windows Defender Firewall", "Windows Defender Antivirus")
+# Define the specific setting path to search for
+$settings = @("Windows Components\Microsoft Defender Antivirus")
+
+# Initialize an array to store results
+$results = @()
 
 # Prompt the user for the path to the CSV file
 $CSVPath = Read-Host "Enter the path to the CSV file (e.g., C:\GPOs.csv)"
 
 # Read the CSV file and extract the GPO names
 $GPOsFromCSV = Import-Csv -Path $CSVPath
-
-# Initialize an array to store results
-$results = @()
 
 foreach ($row in $GPOsFromCSV) {
     $GPOName = $row.GPOName
@@ -28,7 +28,7 @@ foreach ($row in $GPOsFromCSV) {
         # Initialize a flag for findings
         $found = $false
 
-        # Search for settings in specific nodes or attributes
+        # Search for the specific setting in the XML
         foreach ($setting in $settings) {
             if ($xmlContent.InnerXml -like "*$setting*") {
                 $found = $true
@@ -36,12 +36,11 @@ foreach ($row in $GPOsFromCSV) {
             }
         }
         
-        # Add GPOs with the settings found to the results
+        # Add GPOs with the setting found to the results
         if ($found) {
             $results += [PSCustomObject]@{
-                GPOName  = $GPOName
-                Setting1 = $settings[0]
-                Setting2 = $settings[1]
+                GPOName = $GPOName
+                Setting = $settings[0]
             }
         }
     } else {
