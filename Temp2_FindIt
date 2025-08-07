@@ -1,0 +1,57 @@
+# Prompt for OU name (simple name, not full DN)
+$ouInput = Read-Host "Enter the OU name (e.g., Sales, HR, IT)"
+
+# Construct the URL
+$customURL = "lab.us.darkrun.com/IMP/$ouInput"
+
+# Display the constructed URL
+Write-Host "🔗 Using URL: $customURL" -ForegroundColor Cyan
+
+# Search for matching OUs
+$ouList = Get-ADOrganizationalUnit -Filter "Name -like '*$ouInput*'" -Properties Name, DistinguishedName
+
+if ($ouList.Count -eq 0) {
+    Write-Host "❌ No matching OUs found for '$ouInput'. Please check the name." -ForegroundColor Red
+    exit
+}
+
+# Prepare output paths
+$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$csvPath = "$env:USERPROFILE\Desktop\GPO_List_$ouInput_$timestamp.csv"
+$exportPath = "$env:USERPROFILE\Desktop\GPO_Exports_$ouInput_$timestamp"
+New-Item -ItemType Directory -Path $exportPath -Force | Out-Null
+
+# Initialize GPO list
+$linkedGPOs = @()
+
+foreach ($ouItem in $ouList) {
+    $gpoLinks = Get-GPInheritance -Target $ouItem.DistinguishedName
+    foreach ($gpo in $gpoLinks.GpoLinks) {
+        $linkedGPOs += [PSCustomObject]@{
+            OU              = $ouItem.Name
+            OU_DN           = $ouItem.DistinguishedName
+            GPO_Name        = $gpo.DisplayName
+            Enforced        = $gpo.Enforced
+            Source_URL      = $customURL
+        }
+    }
+}
+
+# Write to CSV
+$linkedGPOs | Export-Csv -Path $csvPath -NoTypeInformation
+Write-Host "✅ GPO list saved to: $csvPath" -ForegroundColor Green
+
+# Export each GPO
+foreach ($gpoEntry in $linkedGPOs | Select-Object -Unique GPO_Name) {
+    $gpoName = $gpoEntry.GPO_Name
+    try {
+        $gpo = Get-GPO -Name $gpoName -ErrorAction Stop
+        Backup-GPO -Guid $gpo.Id -Path $exportPath -ErrorAction Stop | Out-Null
+        Write-Host "📦 Exported GPO: $gpoName"
+    } catch {
+        Write-Host "⚠️ Failed to export GPO: $gpoName" -ForegroundColor Yellow
+    }
+}
+
+Write-Host "`n🎉 Script completed. GPOs exported to: $exportPath" -ForegroundColor Cyan
+Write-Host "🔗 Reference URL: $customURL" -ForegroundColor Cyan
