@@ -1,0 +1,73 @@
+# Prompt for top-level OU name
+$ouInput = Read-Host "Enter the top-level OU name (e.g., NYTE)"
+
+# Define output folder
+$basePath = "C:\Temp\GPO-Backup\$ouInput"
+if (-not (Test-Path $basePath)) {
+    New-Item -ItemType Directory -Path $basePath -Force | Out-Null
+    Write-Host "📁 Created folder: $basePath"
+}
+
+# Define file paths
+$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$gpoCsvPath = Join-Path $basePath "GPO_List_$timestamp.csv"
+$ouCsvPath  = Join-Path $basePath "OU_List_$timestamp.csv"
+$exportPath = Join-Path $basePath "GPO_Exports"
+New-Item -ItemType Directory -Path $exportPath -Force | Out-Null
+
+# Get the full DN of the top-level OU
+$topOU = Get-ADOrganizationalUnit -Filter "Name -eq '$ouInput'" -Properties DistinguishedName
+if (-not $topOU) {
+    Write-Host "❌ Top-level OU '$ouInput' not found." -ForegroundColor Red
+    exit
+}
+
+$topOUDN = $topOU.DistinguishedName
+
+# Recursively get all sub-OUs under the top-level OU
+$ouList = Get-ADOrganizationalUnit -Filter * -SearchBase $topOUDN -SearchScope Subtree -Properties Name, DistinguishedName
+
+# Include the top-level OU itself
+$ouList += $topOU
+
+# Write OU list to CSV
+$ouList | Select-Object Name, DistinguishedName | Export-Csv -Path $ouCsvPath -NoTypeInformation
+Write-Host "📄 OU list saved to: $ouCsvPath" -ForegroundColor Green
+
+# Initialize GPO list
+$linkedGPOs = @()
+
+foreach ($ouItem in $ouList) {
+    $gpoLinks = Get-GPInheritance -Target $ouItem.DistinguishedName
+    foreach ($gpo in $gpoLinks.GpoLinks) {
+        # Build path format from OU hierarchy
+        $ouPathParts = ($ouItem.DistinguishedName -split ",") -match "^OU="
+        $ouPath = ($ouPathParts -replace "^OU=") -join "/"
+        $fullPath = "lab.us.darkrun.com/IMP/$ouPath"
+
+        $linkedGPOs += [PSCustomObject]@{
+            GPO_Name        = $gpo.DisplayName
+            Linked_OU       = $ouItem.Name
+            OU_Path         = $fullPath
+            Enforced        = $gpo.Enforced
+        }
+    }
+}
+
+# Write GPO list to CSV
+$linkedGPOs | Export-Csv -Path $gpoCsvPath -NoTypeInformation
+Write-Host "✅ GPO list saved to: $gpoCsvPath" -ForegroundColor Green
+
+# Export each unique GPO
+foreach ($gpoEntry in $linkedGPOs | Select-Object -Unique GPO_Name) {
+    $gpoName = $gpoEntry.GPO_Name
+    try {
+        $gpo = Get-GPO -Name $gpoName -ErrorAction Stop
+        Backup-GPO -Guid $gpo.Id -Path $exportPath -ErrorAction Stop | Out-Null
+        Write-Host "📦 Exported GPO: $gpoName"
+    } catch {
+        Write-Host "⚠️ Failed to export GPO: $gpoName" -ForegroundColor Yellow
+    }
+}
+
+Write-Host "`n🎉 Script completed. All files saved under: $basePath" -ForegroundColor Cyan
