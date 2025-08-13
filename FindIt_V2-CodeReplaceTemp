@@ -1,0 +1,24 @@
+# Helper function to convert DN to readable OU path
+function Convert-DNToOUPath {
+    param ($dn)
+    ($dn -split ',') -replace '^OU=' | Where-Object { $_ -ne '' } | [Array]::Reverse($_) | ForEach-Object { $_ } -join '/'
+}
+
+# Initialize GPO list
+$linkedGPOs = @()
+
+foreach ($ouItem in $ouList) {
+    $gpoLinks = Get-GPInheritance -Target $ouItem.DistinguishedName
+    $ouPath = Convert-DNToOUPath -dn $ouItem.DistinguishedName
+
+    foreach ($gpo in $gpoLinks.GpoLinks) {
+        $linkedGPOs += [PSCustomObject]@{
+            OU_Name         = $ouItem.Name
+            OU_Path         = $ouPath
+            OU_DN           = $ouItem.DistinguishedName
+            GPO_Name        = $gpo.DisplayName
+            Enforced        = $gpo.Enforced
+            Source_URL      = $customURL
+        }
+    }
+}
