@@ -1,7 +1,11 @@
 # Helper function to convert DN to readable OU path
 function Convert-DNToOUPath {
     param ($dn)
-    ($dn -split ',') -replace '^OU=' | Where-Object { $_ -ne '' } | [Array]::Reverse($_) | ForEach-Object { $_ } -join '/'
+
+    $parts = $dn -split ','
+    $ouParts = $parts | Where-Object { $_ -like 'OU=*' } | ForEach-Object { $_ -replace '^OU=' }
+    [Array]::Reverse($ouParts)
+    return $ouParts -join '/'
 }
 
 # Initialize GPO list
