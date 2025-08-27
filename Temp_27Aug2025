@@ -1,0 +1,68 @@
+# Requires: ActiveDirectory and GroupPolicy modules
+Import-Module GroupPolicy -ErrorAction SilentlyContinue
+
+function Show-Menu {
+    Clear-Host
+    Write-Host "Select an Option:`n" -ForegroundColor Cyan
+    Write-Host "1. Enumerate and Export GPOs in an OU"
+    Write-Host "2. Export GPOs from a List"
+    Write-Host ""
+}
+
+function Export-GPOsFromList {
+    $filePath = Read-Host "Enter full path to CSV file (e.g., C:\GPOList.csv)"
+
+    if (-Not (Test-Path $filePath)) {
+        Write-Host "WARNING: File not found. Skipping export." -ForegroundColor Red
+        return
+    }
+
+    try {
+        $gpoList = Import-Csv -Path $filePath
+    } catch {
+        Write-Host "ERROR: Failed to read CSV file. Ensure it's properly formatted." -ForegroundColor Red
+        return
+    }
+
+    foreach ($entry in $gpoList) {
+        $gpoName = $entry.GPOName
+        if (-not $gpoName) {
+            Write-Host "Skipping empty GPO entry." -ForegroundColor DarkYellow
+            continue
+        }
+
+        Write-Host "Exporting GPO: $gpoName" -ForegroundColor Yellow
+
+        try {
+            $exportPath = "C:\GPOExports\$gpoName"
+            if (-not (Test-Path $exportPath)) {
+                New-Item -ItemType Directory -Path $exportPath | Out-Null
+            }
+
+            Backup-GPO -Name $gpoName -Path $exportPath -Domain "labs.xr.tuf.com" -ErrorAction Stop
+            Write-Host "Export complete for: $gpoName" -ForegroundColor Green
+        } catch {
+            Write-Host "ERROR exporting $gpoName: $_" -ForegroundColor Red
+        }
+    }
+}
+
+# Main Execution
+do {
+    Show-Menu
+    $selection = Read-Host "Enter your choice (1 or 2)"
+
+    switch ($selection) {
+        '1' {
+            Write-Host "Option 1 is currently inactive." -ForegroundColor DarkGray
+        }
+        '2' {
+            Export-GPOsFromList
+        }
+        default {
+            Write-Host "Invalid selection. Please choose 1 or 2." -ForegroundColor Red
+        }
+    }
+
+    $repeat = Read-Host "Run again? (Y/N)"
+} while ($repeat -match '^[Yy]$')
