@@ -1,32 +1,20 @@
-# Load required modules
-Import-Module GroupPolicy -ErrorAction Stop
-Import-Module ActiveDirectory -ErrorAction Stop
+function Get-GPOLinkedOUs {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory=$true)]
+        [Guid]$GpoGuid,
 
-# Define domain
-$DomainName = "lab.tx.dev.primarchadept.com"
+        [Parameter(Mandatory=$true)]
+        [string]$DomainName
+    )
 
-# Generate timestamp for filename
-$Timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm"
-$OutputPath = "C:\GPO_Link_Report_$Timestamp.csv"
+    # Load required module
+    Import-Module ActiveDirectory -ErrorAction Stop
 
-# Get all GPOs starting with "_HOTLAB"
-$HotlabGPOs = Get-GPO -All -Domain $DomainName | Where-Object { $_.DisplayName -like "_HOTLAB*" }
+    # Get all OUs in the domain
+    $OUs = Get-ADOrganizationalUnit -Filter * -Properties gPLink -Server $DomainName
 
-# Create a hashtable for quick GPO lookup by GUID
-$GPOMap = @{}
-foreach ($gpo in $HotlabGPOs) {
-    $GPOMap[$gpo.Id.Guid] = $gpo.DisplayName
-}
-
-# Initialize results array
-$Results = @()
-
-# Get all OUs in the domain
-$OUs = Get-ADOrganizationalUnit -Filter * -Properties gPLink -Server $DomainName
-
-# Loop through each GPO
-foreach ($gpo in $HotlabGPOs) {
-    Write-Host "`n🔍 Scanning GPO: $($gpo.DisplayName)" -ForegroundColor Cyan
+    $LinkedOUs = @()
 
     foreach ($OU in $OUs) {
         $gpLinksRaw = $OU.gPLink
@@ -36,15 +24,10 @@ foreach ($gpo in $HotlabGPOs) {
 \[LDAP://|;]' | Where-Object { $_ -match '^CN=.+?{(.+?)}' } | ForEach-Object {
                 $guid = $_ -replace '^CN=.+?{(.+?)}.*$', '$1'
                 try {
-                    $gpoGuid = [Guid]$guid
-                    if ($gpoGuid -eq $gpo.Id.Guid) {
+                    $linkedGuid = [Guid]$guid
+                    if ($linkedGuid -eq $GpoGuid) {
                         $formattedOU = "$DomainName\" + ($OU.DistinguishedName -replace '^OU=', '' -replace ',OU=', '\' -replace ',DC=.*$', '')
-                        Write-Host "   ↳ Linked to OU: $formattedOU" -ForegroundColor Yellow
-
-                        $Results += [PSCustomObject]@{
-                            GPOName  = $gpo.DisplayName
-                            LinkedOU = $formattedOU
-                        }
+                        $LinkedOUs += $formattedOU
                     }
                 } catch {
                     Write-Warning "Invalid GUID format: $guid"
@@ -52,9 +35,6 @@ foreach ($gpo in $HotlabGPOs) {
             }
         }
     }
+
+    return $LinkedOUs
 }
-
-# Export results to timestamped CSV
-$Results | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
-
-Write-Host "`n✅ GPO link report saved to $OutputPath" -ForegroundColor Green
