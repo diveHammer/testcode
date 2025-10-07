@@ -16,6 +16,9 @@ function Get-GPOLinkedOUs {
 
     $LinkedOUs = @()
 
+    # Echo GPO being scanned
+    Write-Host "`n🔍 Scanning GPO: $GpoGuid" -ForegroundColor Green
+
     foreach ($OU in $OUs) {
         $gpLinksRaw = $OU.gPLink
         if (![string]::IsNullOrEmpty($gpLinksRaw)) {
@@ -28,6 +31,9 @@ function Get-GPOLinkedOUs {
                     if ($linkedGuid -eq $GpoGuid) {
                         $formattedOU = "$DomainName\" + ($OU.DistinguishedName -replace '^OU=', '' -replace ',OU=', '\' -replace ',DC=.*$', '')
                         $LinkedOUs += $formattedOU
+
+                        # Echo linked OU
+                        Write-Host "   ↳ Linked to OU: $formattedOU" -ForegroundColor Cyan
                     }
                 } catch {
                     Write-Warning "Invalid GUID format: $guid"
