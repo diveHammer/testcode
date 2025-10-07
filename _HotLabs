@@ -2,9 +2,12 @@
 Import-Module GroupPolicy -ErrorAction Stop
 Import-Module ActiveDirectory -ErrorAction Stop
 
-# Define domain and output path
+# Define domain
 $DomainName = "lab.tx.dev.primarchadept.com"
-$OutputPath = "C:\GPO_Link_Report.csv"
+
+# Generate timestamp for filename
+$Timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm"
+$OutputPath = "C:\GPO_Link_Report_$Timestamp.csv"
 
 # Get all GPOs starting with "_HOTLAB"
 $HotlabGPOs = Get-GPO -All -Domain $DomainName | Where-Object { $_.DisplayName -like "_HOTLAB*" }
@@ -21,34 +24,37 @@ $Results = @()
 # Get all OUs in the domain
 $OUs = Get-ADOrganizationalUnit -Filter * -Properties gPLink -Server $DomainName
 
-foreach ($OU in $OUs) {
-    $gpLinksRaw = $OU.gPLink
-    if (![string]::IsNullOrEmpty($gpLinksRaw)) {
-        Write-Host "🔍 Scanning OU: $($OU.Name)" -ForegroundColor Magenta
+# Loop through each GPO
+foreach ($gpo in $HotlabGPOs) {
+    Write-Host "`n🔍 Scanning GPO: $($gpo.DisplayName)" -ForegroundColor Cyan
 
-        $gpLinksRaw -split '
+    foreach ($OU in $OUs) {
+        $gpLinksRaw = $OU.gPLink
+        if (![string]::IsNullOrEmpty($gpLinksRaw)) {
+            $gpLinksRaw -split '
 
 \[LDAP://|;]' | Where-Object { $_ -match '^CN=.+?{(.+?)}' } | ForEach-Object {
-            $guid = $_ -replace '^CN=.+?{(.+?)}.*$', '$1'
-            try {
-                $gpoGuid = [Guid]$guid
-                if ($GPOMap.ContainsKey($gpoGuid)) {
-                    Write-Host "   ↳ Linked GPO: $($GPOMap[$gpoGuid])" -ForegroundColor Magenta
+                $guid = $_ -replace '^CN=.+?{(.+?)}.*$', '$1'
+                try {
+                    $gpoGuid = [Guid]$guid
+                    if ($gpoGuid -eq $gpo.Id.Guid) {
+                        $formattedOU = "$DomainName\" + ($OU.DistinguishedName -replace '^OU=', '' -replace ',OU=', '\' -replace ',DC=.*$', '')
+                        Write-Host "   ↳ Linked to OU: $formattedOU" -ForegroundColor Yellow
 
-                    $formattedOU = "$DomainName\" + ($OU.DistinguishedName -replace '^OU=', '' -replace ',OU=', '\' -replace ',DC=.*$', '')
-                    $Results += [PSCustomObject]@{
-                        GPOName  = $GPOMap[$gpoGuid]
-                        LinkedOU = $formattedOU
+                        $Results += [PSCustomObject]@{
+                            GPOName  = $gpo.DisplayName
+                            LinkedOU = $formattedOU
+                        }
                     }
+                } catch {
+                    Write-Warning "Invalid GUID format: $guid"
                 }
-            } catch {
-                Write-Warning "Invalid GUID format: $guid"
             }
         }
     }
 }
 
-# Export results to CSV
+# Export results to timestamped CSV
 $Results | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
 
 Write-Host "`n✅ GPO link report saved to $OutputPath" -ForegroundColor Green
