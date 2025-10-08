@@ -5,10 +5,11 @@ function Get-GPOLinks {
         [string]$GPOName
     )
 
-    # Import GroupPolicy module for Get-GPO
+    # Load modules
     Import-Module GroupPolicy -ErrorAction Stop
+    Import-Module ActiveDirectory -ErrorAction Stop
 
-    # Attempt to get the GPO
+    # Get GPO object
     try {
         $GPO = Get-GPO -Name $GPOName -ErrorAction Stop
     }
@@ -17,71 +18,53 @@ function Get-GPOLinks {
         return
     }
 
-    # Prepare timestamp and output file path
-    $Timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
-    $OutputPath = ".\GPO_Link_Report_$($Timestamp).csv"
-
-    # Write GPO header in green
+    # Output header
     Write-Host "`nGPO:" -ForegroundColor Green -NoNewline
     Write-Host " $($GPO.DisplayName)" -ForegroundColor Green
 
-    # Query CIM for GPO links (using RSOP namespaces)
-    # RSOP_SOM represents Scope of Management (OU, Site, Domain)
-    $CimNamespace = "root\rsop\computer"
-    $LinkedObjects = @()
+    # Prepare timestamp and CSV
+    $Timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
+    $OutputPath = ".\GPO_Link_Report_$($Timestamp).csv"
 
-    try {
-        # Query RSOP_GPO class
-        $CimResults = Get-CimInstance -Namespace $CimNamespace -ClassName RSOP_GPO -ErrorAction Stop |
-            Where-Object { $_.ID -eq $GPO.Id.ToString("B") }
+    # Search OUs with gPLink attribute referencing this GPO’s GUID
+    $GUID = $GPO.Id.Guid
+    $LinkedOUs = Get-ADOrganizationalUnit -LDAPFilter "(gPLink=*$GUID*)" -Properties gPLink -ErrorAction SilentlyContinue
 
-        if ($CimResults) {
-            foreach ($Result in $CimResults) {
-                $Scope = $Result.SOMName
-                if ($Scope) {
-                    Write-Host "  Linked To: $Scope" -ForegroundColor Green
+    $Results = @()
 
-                    $LinkedObjects += [PSCustomObject]@{
-                        GPOName   = $GPO.DisplayName
-                        LinkedTo  = $Scope
-                        Enabled   = $Result.Enabled
-                        Enforced  = $Result.NoOverride
-                        Filtered  = $Result.FilterAllowed
-                    }
-                }
-            }
-        }
-        else {
-            # Fallback if RSOP_GPO returns nothing
-            Write-Host "No linked scopes found via RSOP_GPO. Trying alternate method..." -ForegroundColor Yellow
+    foreach ($OU in $LinkedOUs) {
+        Write-Host "  Linked To: $($OU.DistinguishedName)" -ForegroundColor Green
 
-            # Fallback: Direct AD query via LDAP filter
-            $GUID = $GPO.Id.Guid
-            $LinkedOUs = Get-ADOrganizationalUnit -LDAPFilter "(gPLink=*$GUID*)" -ErrorAction SilentlyContinue
+        # Detect if link is enforced (look for “2” in gPLink value)
+        $IsEnforced = if ($OU.gPLink -match "[$GUID];[0-9]+;[0-9]+;[0-9]+;[0-9]+;[0-9]+;[0-9]+;2") { $true } else { $false }
 
-            foreach ($OU in $LinkedOUs) {
-                Write-Host "  Linked To (OU): $($OU.DistinguishedName)" -ForegroundColor Green
-                $LinkedObjects += [PSCustomObject]@{
-                    GPOName   = $GPO.DisplayName
-                    LinkedTo  = $OU.DistinguishedName
-                    Enabled   = $true
-                    Enforced  = $false
-                    Filtered  = $null
-                }
-            }
-        }
-
-        if (-not $LinkedObjects) {
-            Write-Host "No OUs, domains, or sites linked to this GPO." -ForegroundColor Yellow
-        }
-        else {
-            # Export to CSV
-            $LinkedObjects | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
-            Write-Host "`nResults exported to $OutputPath" -ForegroundColor Green
+        $Results += [PSCustomObject]@{
+            GPOName  = $GPO.DisplayName
+            LinkedTo = $OU.DistinguishedName
+            Enabled  = $true
+            Enforced = $IsEnforced
         }
     }
-    catch {
-        Write-Host "Error while querying WMI/CIM: $_" -ForegroundColor Red
+
+    # Include domain root if linked
+    $Domain = (Get-ADDomain).DistinguishedName
+    $DomainObj = Get-ADObject -Identity $Domain -Properties gPLink -ErrorAction SilentlyContinue
+    if ($DomainObj.gPLink -match $GUID) {
+        Write-Host "  Linked To (Domain): $Domain" -ForegroundColor Green
+        $Results += [PSCustomObject]@{
+            GPOName  = $GPO.DisplayName
+            LinkedTo = $Domain
+            Enabled  = $true
+            Enforced = ($DomainObj.gPLink -match ";2")
+        }
+    }
+
+    if ($Results.Count -eq 0) {
+        Write-Host "No OUs or domain roots linked to this GPO." -ForegroundColor Yellow
+    }
+    else {
+        $Results | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+        Write-Host "`nResults exported to $OutputPath" -ForegroundColor Green
     }
 
     Write-Host "`nDone." -ForegroundColor Green
