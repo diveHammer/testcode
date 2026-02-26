@@ -20,4 +20,35 @@ while ($stream.Position -lt $stream.Length) {
     $stream.Read($sigHeaderSize, 0, 4) | Out-Null
     $headerSize = [BitConverter]::ToUInt32($sigHeaderSize, 0)
 
-    $sigSizeBytes = New-Object byte
+    $sigSizeBytes = New-Object byte[] 4
+    $stream.Read($sigSizeBytes, 0, 4) | Out-Null
+    $sigSize = [BitConverter]::ToUInt32($sigSizeBytes, 0)
+
+    # Skip header
+    $stream.Position += $headerSize
+
+    # Number of signatures
+    $count = ($listSize - 28 - $headerSize) / $sigSize
+
+    for ($i = 0; $i -lt $count; $i++) {
+        # Skip signature owner GUID
+        $stream.Position += 16
+
+        # Read certificate bytes
+        $certBytes = New-Object byte[] ($sigSize - 16)
+        $stream.Read($certBytes, 0, $certBytes.Length) | Out-Null
+
+        try {
+            $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 -ArgumentList @(,$certBytes)
+            [PSCustomObject]@{
+                Subject    = $cert.Subject
+                Issuer     = $cert.Issuer
+                NotBefore  = $cert.NotBefore
+                NotAfter   = $cert.NotAfter
+                Thumbprint = $cert.Thumbprint
+            }
+        } catch {
+            # Ignore non-certificate entries
+        }
+    }
+}
