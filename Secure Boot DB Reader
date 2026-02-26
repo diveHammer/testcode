@@ -1,0 +1,23 @@
+# Read the Secure Boot DB variable
+$db = Get-SecureBootUEFI -Name db
+
+# Extract the raw bytes
+$bytes = $db.Bytes
+
+# Convert to a memory stream
+$stream = New-Object System.IO.MemoryStream(,$bytes)
+
+# Read the EFI Signature List format
+while ($stream.Position -lt $stream.Length) {
+    $sigType = New-Object byte[] 16
+    $stream.Read($sigType, 0, 16) | Out-Null
+
+    $sigListSize = New-Object byte[] 4
+    $stream.Read($sigListSize, 0, 4) | Out-Null
+    $listSize = [BitConverter]::ToUInt32($sigListSize, 0)
+
+    $sigHeaderSize = New-Object byte[] 4
+    $stream.Read($sigHeaderSize, 0, 4) | Out-Null
+    $headerSize = [BitConverter]::ToUInt32($sigHeaderSize, 0)
+
+    $sigSizeBytes = New-Object byte
