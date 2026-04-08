@@ -1,54 +1,73 @@
-# Import the Active Directory module
-Import-Module ActiveDirectory
+<#
+.SYNOPSIS
+    Scans all GPOs for configured Power Options under:
+    COMPUTER CONFIGURATION\PREFERENCES\CONTROL PANEL SETTINGS\POWER OPTIONS
 
-# Define the specific setting path to search for
-$settings = @("Windows Components\Microsoft Defender Antivirus")
+    Outputs:
+        - GPO Name
+        - Section (Computer)
+        - Power Plan (Balanced, High Performance, etc.)
+        - Saved to CSV
 
-# Initialize an array to store results
+#>
+
+Import-Module GroupPolicy
+
+# Prompt for save path
+$savePath = Read-Host "Enter path to save report (default: C:\Temp)"
+
+if ([string]::IsNullOrWhiteSpace($savePath)) {
+    $savePath = "C:\Temp"
+}
+
+if (-not (Test-Path $savePath)) {
+    Write-Host "Path does not exist. Creating $savePath..." -ForegroundColor Yellow
+    New-Item -ItemType Directory -Path $savePath | Out-Null
+}
+
+$csvFile = Join-Path $savePath "GPO_PowerSettingsReport.csv"
+
 $results = @()
 
-# Prompt the user for the path to the CSV file
-$CSVPath = Read-Host "Enter the path to the CSV file (e.g., C:\GPOs.csv)"
+Write-Host "`nScanning GPOs..." -ForegroundColor Cyan
 
-# Read the CSV file and extract the GPO names
-$GPOsFromCSV = Import-Csv -Path $CSVPath
+# Get all GPOs alphabetically
+$gpos = Get-GPO -All | Sort-Object DisplayName
 
-foreach ($row in $GPOsFromCSV) {
-    $GPOName = $row.GPOName
-    Write-Host "Checking GPO: $GPOName" -ForegroundColor Yellow
-    
-    # Retrieve the GPO
-    $GPO = Get-Gpo -Name $GPOName -ErrorAction SilentlyContinue
-    
-    if ($GPO -ne $null) {
-        # Retrieve the GPO report as XML
-        $GPOContent = Get-GpoReport -Guid $GPO.Id -ReportType Xml
-        $xmlContent = [xml]$GPOContent
-        
-        # Initialize a flag for findings
-        $found = $false
+foreach ($gpo in $gpos) {
 
-        # Search for the specific setting in the XML
-        foreach ($setting in $settings) {
-            if ($xmlContent.InnerXml -like "*$setting*") {
-                $found = $true
-                Write-Host "Found setting: $setting in GPO: $GPOName" -ForegroundColor Green
+    Write-Host "Processing: $($gpo.DisplayName)" -ForegroundColor Yellow
+
+    # Get XML report
+    $xml = Get-GPOReport -Guid $gpo.Id -ReportType Xml
+    $gpoXml = [xml]$xml
+
+    # Navigate to Computer Preferences → Control Panel Settings → Power Options
+    $powerOptions = $gpoXml.GPO.Computer.ExtensionData.Extension |
+        Where-Object { $_.Name -eq "PowerOptions" }
+
+    if ($powerOptions) {
+
+        foreach ($entry in $powerOptions.PowerScheme) {
+
+            # Extract the power plan name
+            $planName = $entry.Name
+
+            if ($planName) {
+                $results += [pscustomobject]@{
+                    GPOName   = $gpo.DisplayName
+                    Section   = "Computer"
+                    PowerPlan = $planName
+                }
             }
         }
-        
-        # Add GPOs with the setting found to the results
-        if ($found) {
-            $results += [PSCustomObject]@{
-                GPOName = $GPOName
-                Setting = $settings[0]
-            }
-        }
-    } else {
-        Write-Host "GPO '$GPOName' not found in the domain. Please check the name and try again." -ForegroundColor Red
     }
 }
 
-# Export results to CSV
-$results | Export-Csv -Path "GPO_Settings_Report.csv" -NoTypeInformation
+# Output to screen
+$results | Format-Table -AutoSize
 
-Write-Host "Report generated: GPO_Settings_Report.csv" -ForegroundColor Cyan
+# Export to CSV
+$results | Export-Csv -Path $csvFile -NoTypeInformation -Encoding UTF8
+
+Write-Host "`nReport saved to: $csvFile" -ForegroundColor Green
