@@ -1,0 +1,105 @@
+Import-Module GroupPolicy -ErrorAction Stop
+
+# Prompt user for output path
+$path = Read-Host "Enter path to save report (press Enter for default C:\Temp)"
+
+if ([string]::IsNullOrWhiteSpace($path)) {
+    $path = "C:\Temp"
+}
+
+# Ensure directory exists
+if (!(Test-Path $path)) {
+    New-Item -Path $path -ItemType Directory | Out-Null
+}
+
+# Output file
+$csvPath = Join-Path $path "GPO_PowerSettingsReport.csv"
+
+# Initialize results array
+$results = @()
+
+# Get all GPOs sorted alphabetically
+$gpos = Get-GPO -All | Sort-Object DisplayName
+
+foreach ($gpo in $gpos) {
+
+    Write-Host "`nProcessing GPO: $($gpo.DisplayName)" -ForegroundColor Cyan
+
+    $found = $false
+
+    try {
+        # Get GPO report as XML
+        [xml]$report = Get-GPOReport -Guid $gpo.Id -ReportType Xml
+
+        # --- COMPUTER CONFIGURATION ---
+        $computerNodes = $report.GPO.Computer.ExtensionData.Extension
+
+        foreach ($ext in $computerNodes) {
+            if ($ext.Name -like "*Power Options*") {
+
+                foreach ($power in $ext.PowerOptions) {
+
+                    $plan = $power.Properties.PowerPlan
+
+                    if ($plan) {
+                        $found = $true
+
+                        $obj = [PSCustomObject]@{
+                            GPOName   = $gpo.DisplayName
+                            Scope     = "Computer"
+                            PowerPlan = $plan
+                        }
+
+                        # Output to screen
+                        Write-Host "  [FOUND] Computer -> Power Plan: $plan" -ForegroundColor Green
+
+                        # Add to results
+                        $results += $obj
+                    }
+                }
+            }
+        }
+
+        # --- USER CONFIGURATION ---
+        $userNodes = $report.GPO.User.ExtensionData.Extension
+
+        foreach ($ext in $userNodes) {
+            if ($ext.Name -like "*Power Options*") {
+
+                foreach ($power in $ext.PowerOptions) {
+
+                    $plan = $power.Properties.PowerPlan
+
+                    if ($plan) {
+                        $found = $true
+
+                        $obj = [PSCustomObject]@{
+                            GPOName   = $gpo.DisplayName
+                            Scope     = "User"
+                            PowerPlan = $plan
+                        }
+
+                        # Output to screen
+                        Write-Host "  [FOUND] User     -> Power Plan: $plan" -ForegroundColor Green
+
+                        # Add to results
+                        $results += $obj
+                    }
+                }
+            }
+        }
+
+        if (-not $found) {
+            Write-Host "  [NONE] No Power Options configured" -ForegroundColor Yellow
+        }
+
+    } catch {
+        Write-Warning "Failed to process GPO: $($gpo.DisplayName)"
+    }
+}
+
+# Export results
+$results | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+
+Write-Host "`nReport complete." -ForegroundColor Green
+Write-Host "Saved to: $csvPath"
