@@ -1,0 +1,219 @@
+#Requires -Modules GroupPolicy
+<#
+.SYNOPSIS
+    Scans all GPOs in the domain for the DownloadRestrictions policy applied to
+    Microsoft Edge and/or Google Chrome (Chromium-based browsers).
+
+.DESCRIPTION
+    Iterates through every GPO in the domain (alphabetically) and checks the
+    DownloadRestrictions registry value for both browsers:
+
+        Microsoft Edge
+            HKLM\Software\Policies\Microsoft\Edge
+            Value: DownloadRestrictions
+
+        Google Chrome
+            HKLM\Software\Policies\Google\Chrome
+            Value: DownloadRestrictions
+
+    DownloadRestrictions numeric values and their meaning:
+        0  –  No special restrictions
+        1  –  BlockDangerousDownloads          (blocks confirmed-dangerous files)
+        2  –  BlockPotentiallyDangerousDownloads (blocks dangerous + potentially dangerous, e.g. .exe)
+        3  –  BlockAllDownloads                 (blocks all downloads)
+        4  –  BlockMaliciousDownloads           (blocks malware; less restrictive than 1)
+
+    Only GPOs where DownloadRestrictions is set to 1, 2, or 3 (the values that
+    restrict .exe / dangerous downloads) are written to the CSV report.
+    GPOs with value 0, value 4, or no setting are skipped.
+
+.PARAMETER OutputCSV
+    Full path for the CSV output file.
+    Default: .\GPO_DownloadRestrictions_Report_<timestamp>.csv
+
+.PARAMETER Domain
+    Target domain FQDN. Defaults to the current user's domain.
+
+.PARAMETER IncludeAllRestrictive
+    When specified, also includes value 4 (BlockMaliciousDownloads) in the report.
+    By default only values 1-3 are reported as they directly prevent .exe downloads.
+
+.EXAMPLE
+    .\Get-GPODownloadRestrictions.ps1
+
+.EXAMPLE
+    .\Get-GPODownloadRestrictions.ps1 -OutputCSV "C:\Reports\DownloadRestrictions.csv" -Domain "corp.contoso.com"
+
+.EXAMPLE
+    .\Get-GPODownloadRestrictions.ps1 -IncludeAllRestrictive
+
+.NOTES
+    Requires the GroupPolicy PowerShell module (RSAT: Group Policy Management Tools).
+    Must be run with an account that has read access to SYSVOL / GPO objects.
+    Reference: https://chromeenterprise.google/policies/#DownloadRestrictions
+               https://learn.microsoft.com/en-us/deployedge/microsoft-edge-policies#downloadrestrictions
+#>
+
+[CmdletBinding()]
+param (
+    [string]$OutputCSV          = ".\GPO_DownloadRestrictions_Report_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv",
+    [string]$Domain             = $env:USERDNSDOMAIN,
+    [switch]$IncludeAllRestrictive
+)
+
+# ── DownloadRestrictions value map ────────────────────────────────────────────
+# Key = DWord value stored in registry
+$ValueMap = @{
+    0 = 'NoRestrictions'
+    1 = 'BlockDangerousDownloads'
+    2 = 'BlockPotentiallyDangerousDownloads'
+    3 = 'BlockAllDownloads'
+    4 = 'BlockMaliciousDownloads'
+}
+
+# Values that actively prevent dangerous / .exe downloads (reported by default)
+$ReportableValues = @(1, 2, 3)
+if ($IncludeAllRestrictive) { $ReportableValues += 4 }
+
+# ── Browser targets: friendly name → registry key ────────────────────────────
+$Browsers = [ordered]@{
+    'Microsoft Edge' = 'HKLM\Software\Policies\Microsoft\Edge'
+    'Google Chrome'  = 'HKLM\Software\Policies\Google\Chrome'
+}
+
+$RegValueName = 'DownloadRestrictions'
+
+# ── Colour helpers ────────────────────────────────────────────────────────────
+function Write-Status {
+    param(
+        [string]$GPOName,
+        [string]$Status,
+        [string]$Detail = ''
+    )
+    $colour = switch ($Status) {
+        'Scanning'   { 'Cyan'     }
+        'Found'      { 'Green'    }
+        'Not Found'  { 'DarkGray' }
+        'Error'      { 'Red'      }
+        default      { 'White'    }
+    }
+    $line = "[{0}]  GPO: {1}" -f $Status.PadRight(10), $GPOName
+    if ($Detail) { $line += "  |  $Detail" }
+    Write-Host $line -ForegroundColor $colour
+}
+
+# ── Accumulator for CSV rows ──────────────────────────────────────────────────
+# One row per GPO (not per browser), with separate columns for Edge/Chrome
+$Results = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+# ── Load all GPOs sorted alphabetically ──────────────────────────────────────
+Write-Host "`nConnecting to domain: $Domain" -ForegroundColor Yellow
+try {
+    $AllGPOs = Get-GPO -All -Domain $Domain | Sort-Object DisplayName
+}
+catch {
+    Write-Host "ERROR: Could not retrieve GPOs. Ensure RSAT (Group Policy) is installed and you have domain access.`n$_" -ForegroundColor Red
+    exit 1
+}
+
+Write-Host "Found $($AllGPOs.Count) GPO(s). Starting scan...`n" -ForegroundColor Yellow
+Write-Host ("{0,-12}  {1,-55}  {2}" -f "Status", "GPO Name", "Detail") -ForegroundColor White
+Write-Host ("-" * 110) -ForegroundColor DarkGray
+
+foreach ($GPO in $AllGPOs) {
+    $GPOName    = $GPO.DisplayName
+    $FoundInGPO = $false   # tracks whether anything reportable was found
+
+    Write-Status -GPOName $GPOName -Status 'Scanning'
+
+    # Collect per-browser results for this GPO
+    $BrowserResults = [ordered]@{}
+    foreach ($BrowserName in $Browsers.Keys) {
+        $BrowserResults[$BrowserName] = $null   # null = not configured / not reportable
+    }
+
+    foreach ($BrowserName in $Browsers.Keys) {
+        $RegKey = $Browsers[$BrowserName]
+
+        try {
+            $RegResult = Get-GPRegistryValue `
+                -Guid        $GPO.Id `
+                -Domain      $Domain `
+                -Key         $RegKey `
+                -ValueName   $RegValueName `
+                -ErrorAction Stop
+
+            $NumericValue = [int]$RegResult.Value
+
+            if ($NumericValue -in $ReportableValues) {
+                $PolicyLabel = if ($ValueMap.ContainsKey($NumericValue)) {
+                    $ValueMap[$NumericValue]
+                } else {
+                    "UnknownValue($NumericValue)"
+                }
+
+                $BrowserResults[$BrowserName] = $PolicyLabel
+                $FoundInGPO = $true
+
+                Write-Status -GPOName $GPOName -Status 'Found' `
+                    -Detail "$BrowserName → $PolicyLabel (value $NumericValue)"
+            }
+            # Value 0 or 4 (when -IncludeAllRestrictive not set) → skip silently
+        }
+        catch [System.ArgumentException] {
+            # Key or value not present in this GPO — expected, continue
+        }
+        catch {
+            Write-Status -GPOName $GPOName -Status 'Error' `
+                -Detail "[$BrowserName] $($_.Exception.Message)"
+        }
+    }
+
+    if ($FoundInGPO) {
+        # Build a single CSV row covering both browsers for this GPO
+        $Results.Add([PSCustomObject]@{
+            GPOName                              = $GPOName
+            GPOID                                = $GPO.Id.ToString()
+            'Microsoft Edge - DownloadRestrictions' = if ($BrowserResults['Microsoft Edge']) { $BrowserResults['Microsoft Edge'] } else { 'NotConfigured' }
+            'Google Chrome - DownloadRestrictions'  = if ($BrowserResults['Google Chrome'])  { $BrowserResults['Google Chrome']  } else { 'NotConfigured' }
+            BlockDangerousDownloads              = (($BrowserResults.Values -contains 'BlockDangerousDownloads')             ? 'Yes' : 'No')
+            BlockPotentiallyDangerousDownloads   = (($BrowserResults.Values -contains 'BlockPotentiallyDangerousDownloads')  ? 'Yes' : 'No')
+            BlockAllDownloads                    = (($BrowserResults.Values -contains 'BlockAllDownloads')                   ? 'Yes' : 'No')
+            Timestamp                            = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+        })
+    }
+    else {
+        Write-Status -GPOName $GPOName -Status 'Not Found'
+    }
+}
+
+Write-Host ("-" * 110) -ForegroundColor DarkGray
+
+# ── Write CSV ─────────────────────────────────────────────────────────────────
+if ($Results.Count -gt 0) {
+    try {
+        $Results | Export-Csv -Path $OutputCSV -NoTypeInformation -Encoding UTF8
+        Write-Host "`nScan complete. $($Results.Count) GPO(s) with reportable DownloadRestrictions found." -ForegroundColor Green
+        Write-Host "CSV report saved to: $((Resolve-Path $OutputCSV).Path)" -ForegroundColor Green
+
+        # ── Summary table on screen ───────────────────────────────────────────
+        Write-Host "`n── Summary ─────────────────────────────────────────────────────────────────" -ForegroundColor Yellow
+        $Results | Format-Table -AutoSize `
+            GPOName,
+            'Microsoft Edge - DownloadRestrictions',
+            'Google Chrome - DownloadRestrictions',
+            BlockDangerousDownloads,
+            BlockPotentiallyDangerousDownloads,
+            BlockAllDownloads
+    }
+    catch {
+        Write-Host "`nERROR: Could not write CSV to '$OutputCSV'.`n$_" -ForegroundColor Red
+    }
+}
+else {
+    Write-Host "`nScan complete. No GPOs with DownloadRestrictions set to BlockDangerousDownloads," -ForegroundColor Yellow
+    Write-Host "BlockPotentiallyDangerousDownloads, or BlockAllDownloads were found." -ForegroundColor Yellow
+    Write-Host "No CSV file created (nothing to report)." -ForegroundColor Yellow
+}
+
+Write-Host ""
