@@ -28,6 +28,10 @@
 
     The script prompts interactively for the CSV save path at startup.
 
+    Compatible with Windows PowerShell 3.0 and later (including 4.0, 5.0, 5.1
+    and PowerShell 7+). The GroupPolicy module requires Windows PowerShell
+    (not PowerShell Core / PS 7) unless RSAT is installed on the target system.
+
 .PARAMETER Domain
     Target domain FQDN. Defaults to the current user's domain.
 
@@ -41,10 +45,20 @@
     .\Get-GPODownloadRestrictions.ps1 -Domain "corp.contoso.com" -IncludeAllRestrictive
 
 .NOTES
-    Requires the GroupPolicy PowerShell module (RSAT: Group Policy Management Tools).
-    Must be run with an account that has read access to SYSVOL / GPO objects.
-    Reference: https://chromeenterprise.google/policies/#DownloadRestrictions
-               https://learn.microsoft.com/en-us/deployedge/microsoft-edge-policies#downloadrestrictions
+    Minimum PowerShell version : 3.0
+    Requires RSAT               : Group Policy Management Tools
+    Run as                      : Account with GPO read access in the domain
+
+    Reference:
+        https://chromeenterprise.google/policies/#DownloadRestrictions
+        https://learn.microsoft.com/en-us/deployedge/microsoft-edge-policies#downloadrestrictions
+
+    --- Compatibility fixes applied (vs original draft) ---
+    [PS 7.0+] Ternary operator  (? :)           replaced with if/else blocks
+    [PS 5.0+] ::new() constructor                replaced with New-Object
+    [PS 3.0+] [ordered]@{} inside loop           replaced with New-Object System.Collections.Specialized.OrderedDictionary
+    [PS 3.0+] -in operator                       replaced with -contains
+    [PS 3.0+] [string]::IsNullOrWhiteSpace()     replaced with -match and .Trim() check
 #>
 
 [CmdletBinding()]
@@ -56,14 +70,14 @@ param (
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 1 — Interactive save-path prompt
 # ─────────────────────────────────────────────────────────────────────────────
-$DefaultTimestamp  = Get-Date -Format 'yyyyMMdd_HHmmss'
-$DefaultFileName   = "GPO_DownloadRestrictions_Report_$DefaultTimestamp.csv"
-$DefaultSavePath   = Join-Path ([Environment]::GetFolderPath('Desktop')) $DefaultFileName
+$DefaultTimestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$DefaultFileName  = "GPO_DownloadRestrictions_Report_$DefaultTimestamp.csv"
+$DefaultSavePath  = Join-Path ([Environment]::GetFolderPath('Desktop')) $DefaultFileName
 
 Write-Host ""
-Write-Host "╔══════════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
-Write-Host "║       GPO DownloadRestrictions Scanner - Edge & Chrome           ║" -ForegroundColor Cyan
-Write-Host "╚══════════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+Write-Host "=================================================================" -ForegroundColor Cyan
+Write-Host "   GPO DownloadRestrictions Scanner - Edge & Chrome              " -ForegroundColor Cyan
+Write-Host "=================================================================" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "  Enter the full path where the CSV report should be saved." -ForegroundColor White
 Write-Host "  Press ENTER to accept the default path shown below." -ForegroundColor DarkGray
@@ -73,18 +87,20 @@ Write-Host ""
 
 # Keep prompting until the user provides a valid, writable path
 $OutputCSV = $null
-while (-not $OutputCSV) {
+while ($null -eq $OutputCSV) {
+
     $RawInput = Read-Host "  Save report to"
 
     # Accept default if user pressed Enter with no input
-    if ([string]::IsNullOrWhiteSpace($RawInput)) {
+    # PS 3.0-safe null/whitespace check (avoids IsNullOrWhiteSpace)
+    if (($null -eq $RawInput) -or ($RawInput.Trim() -eq '')) {
         $RawInput = $DefaultSavePath
     }
 
     # Ensure the path ends with .csv
     if ($RawInput -notmatch '\.csv$') {
         $RawInput = $RawInput.TrimEnd('\', '/') + "\$DefaultFileName"
-        Write-Host "  No filename specified — using: $RawInput" -ForegroundColor DarkGray
+        Write-Host "  No filename specified - using: $RawInput" -ForegroundColor DarkGray
     }
 
     # Validate that the parent directory exists (offer to create it if not)
@@ -115,7 +131,7 @@ while (-not $OutputCSV) {
     # Test write access with a temporary file
     $TestFile = Join-Path $ParentDir "write_test_$DefaultTimestamp.tmp"
     try {
-        [System.IO.File]::WriteAllText($TestFile, 'test') | Out-Null
+        [System.IO.File]::WriteAllText($TestFile, 'test')
         Remove-Item $TestFile -ErrorAction SilentlyContinue
         $OutputCSV = $RawInput
     }
@@ -134,7 +150,8 @@ Write-Host ""
 # SECTION 2 — Configuration
 # ─────────────────────────────────────────────────────────────────────────────
 
-# DownloadRestrictions numeric value → policy label
+# DownloadRestrictions numeric value -> policy label
+# Standard hashtable — compatible with PS 2.0+
 $ValueMap = @{
     0 = 'NoRestrictions'
     1 = 'BlockDangerousDownloads'
@@ -148,10 +165,11 @@ $ReportableValues = @(1, 2, 3)
 if ($IncludeAllRestrictive) { $ReportableValues += 4 }
 
 # Browser name -> registry key
-$Browsers = [ordered]@{
-    'Microsoft Edge' = 'HKLM\Software\Policies\Microsoft\Edge'
-    'Google Chrome'  = 'HKLM\Software\Policies\Google\Chrome'
-}
+# [ordered]@{} requires PS 3.0+; use OrderedDictionary for PS 2.0 safety.
+# This script targets PS 3.0+ but the explicit type documents intent clearly.
+$Browsers = New-Object System.Collections.Specialized.OrderedDictionary
+$Browsers.Add('Microsoft Edge', 'HKLM\Software\Policies\Microsoft\Edge')
+$Browsers.Add('Google Chrome',  'HKLM\Software\Policies\Google\Chrome')
 
 $RegValueName = 'DownloadRestrictions'
 
@@ -162,8 +180,11 @@ function Write-Status {
     param(
         [string]$GPOName,
         [string]$Status,
-        [string]$Detail = ''
+        [string]$Detail
     )
+    # Default value for optional param — compatible with PS 2.0+
+    if ($null -eq $Detail) { $Detail = '' }
+
     $colour = switch ($Status) {
         'Scanning'   { 'Cyan'     }
         'Found'      { 'Green'    }
@@ -172,7 +193,7 @@ function Write-Status {
         default      { 'White'    }
     }
     $line = "[{0}]  GPO: {1}" -f $Status.PadRight(10), $GPOName
-    if ($Detail) { $line += "  |  $Detail" }
+    if ($Detail -ne '') { $line += "  |  $Detail" }
     Write-Host $line -ForegroundColor $colour
 }
 
@@ -198,7 +219,9 @@ Write-Host ("-" * 110) -ForegroundColor DarkGray
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 5 — Scan loop
 # ─────────────────────────────────────────────────────────────────────────────
-$Results = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+# New-Object replaces ::new() — compatible with PS 2.0+
+$Results = New-Object System.Collections.Generic.List[PSCustomObject]
 
 foreach ($GPO in $AllGPOs) {
     $GPOName    = $GPO.DisplayName
@@ -206,8 +229,8 @@ foreach ($GPO in $AllGPOs) {
 
     Write-Status -GPOName $GPOName -Status 'Scanning'
 
-    # Initialise per-browser result slots
-    $BrowserResults = [ordered]@{}
+    # Per-browser result slots — OrderedDictionary for PS 2.0+ compatibility
+    $BrowserResults = New-Object System.Collections.Specialized.OrderedDictionary
     foreach ($BrowserName in $Browsers.Keys) {
         $BrowserResults[$BrowserName] = $null
     }
@@ -225,11 +248,14 @@ foreach ($GPO in $AllGPOs) {
 
             $NumericValue = [int]$RegResult.Value
 
-            if ($NumericValue -in $ReportableValues) {
-                $PolicyLabel = if ($ValueMap.ContainsKey($NumericValue)) {
-                    $ValueMap[$NumericValue]
-                } else {
-                    "UnknownValue($NumericValue)"
+            # -contains replaces -in operator (PS 2.0+ safe)
+            if ($ReportableValues -contains $NumericValue) {
+
+                if ($ValueMap.ContainsKey($NumericValue)) {
+                    $PolicyLabel = $ValueMap[$NumericValue]
+                }
+                else {
+                    $PolicyLabel = "UnknownValue($NumericValue)"
                 }
 
                 $BrowserResults[$BrowserName] = $PolicyLabel
@@ -238,7 +264,7 @@ foreach ($GPO in $AllGPOs) {
                 Write-Status -GPOName $GPOName -Status 'Found' `
                     -Detail "$BrowserName -> $PolicyLabel (value $NumericValue)"
             }
-            # Value 0 or non-reportable value -> skip silently
+            # Value 0 or non-reportable -> skip silently
         }
         catch [System.ArgumentException] {
             # Key or value not present in this GPO — expected, continue
@@ -250,15 +276,56 @@ foreach ($GPO in $AllGPOs) {
     }
 
     if ($FoundInGPO) {
+
+        # Resolve Edge value — if/else replaces ternary (? :) operator (PS 7.0+)
+        if ($BrowserResults['Microsoft Edge']) {
+            $EdgeValue = $BrowserResults['Microsoft Edge']
+        }
+        else {
+            $EdgeValue = 'NotConfigured'
+        }
+
+        # Resolve Chrome value
+        if ($BrowserResults['Google Chrome']) {
+            $ChromeValue = $BrowserResults['Google Chrome']
+        }
+        else {
+            $ChromeValue = 'NotConfigured'
+        }
+
+        # Resolve boolean summary columns — -contains replaces -in
+        $AllValues = @($BrowserResults['Microsoft Edge'], $BrowserResults['Google Chrome'])
+
+        if ($AllValues -contains 'BlockDangerousDownloads') {
+            $HasBlock1 = 'Yes'
+        }
+        else {
+            $HasBlock1 = 'No'
+        }
+
+        if ($AllValues -contains 'BlockPotentiallyDangerousDownloads') {
+            $HasBlock2 = 'Yes'
+        }
+        else {
+            $HasBlock2 = 'No'
+        }
+
+        if ($AllValues -contains 'BlockAllDownloads') {
+            $HasBlock3 = 'Yes'
+        }
+        else {
+            $HasBlock3 = 'No'
+        }
+
         $Results.Add([PSCustomObject]@{
-            GPOName                                  = $GPOName
-            GPOID                                    = $GPO.Id.ToString()
-            'Microsoft Edge - DownloadRestrictions'  = if ($BrowserResults['Microsoft Edge']) { $BrowserResults['Microsoft Edge'] } else { 'NotConfigured' }
-            'Google Chrome - DownloadRestrictions'   = if ($BrowserResults['Google Chrome'])  { $BrowserResults['Google Chrome']  } else { 'NotConfigured' }
-            BlockDangerousDownloads                  = (($BrowserResults.Values -contains 'BlockDangerousDownloads')            ? 'Yes' : 'No')
-            BlockPotentiallyDangerousDownloads       = (($BrowserResults.Values -contains 'BlockPotentiallyDangerousDownloads') ? 'Yes' : 'No')
-            BlockAllDownloads                        = (($BrowserResults.Values -contains 'BlockAllDownloads')                  ? 'Yes' : 'No')
-            Timestamp                                = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+            GPOName                                 = $GPOName
+            GPOID                                   = $GPO.Id.ToString()
+            'Microsoft Edge - DownloadRestrictions' = $EdgeValue
+            'Google Chrome - DownloadRestrictions'  = $ChromeValue
+            BlockDangerousDownloads                 = $HasBlock1
+            BlockPotentiallyDangerousDownloads      = $HasBlock2
+            BlockAllDownloads                       = $HasBlock3
+            Timestamp                               = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
         })
     }
     else {
