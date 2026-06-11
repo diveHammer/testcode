@@ -1,0 +1,590 @@
+#Requires -Modules GroupPolicy
+<#
+.SYNOPSIS
+    Scans all GPOs in the domain for Microsoft Defender Antivirus and Microsoft
+    Defender for Endpoint (MDE) policy settings.
+
+.DESCRIPTION
+    Iterates every GPO in the domain alphabetically and checks all known
+    Defender / MDE registry-backed policy values across the following groups:
+
+        - Real-Time Protection
+        - Cloud Protection / MAPS
+        - Scanning
+        - Exclusions  (Paths, Extensions, Processes)
+        - Attack Surface Reduction (ASR Rules)
+        - Controlled Folder Access
+        - Network Protection
+        - Exploit Protection
+        - Windows Defender Firewall
+        - MDE Onboarding
+        - MDE EDR / Sense
+        - SmartScreen
+        - Credential Guard / Device Guard
+
+    STATUS values written to the CSV:
+        Enabled                  - Policy is configured and protection is ON
+        Enabled - Protection OFF - A "Disable*" flag is set to 1 (turns OFF protection)
+        Enabled - Blank          - Policy key exists but value is empty / zero
+        Enabled - Audit Mode     - ASR rule set to audit (value 2)
+        Configured: <value>      - Numeric/string policy with the raw value shown
+
+    Settings that are not configured in a GPO are silently skipped.
+    The script prompts interactively for the CSV save path at startup.
+
+    Compatible with Windows PowerShell 3.0 and later (4.0, 5.0, 5.1, 7+).
+
+.PARAMETER Domain
+    Target domain FQDN. Defaults to the current user's domain.
+
+.EXAMPLE
+    .\Get-GPODefenderPolicies.ps1
+
+.EXAMPLE
+    .\Get-GPODefenderPolicies.ps1 -Domain "corp.contoso.com"
+
+.NOTES
+    Minimum PowerShell version : 3.0
+    Requires RSAT               : Group Policy Management Tools
+    Run as                      : Account with GPO read access in the domain
+
+    --- Compatibility notes ---
+    No ternary operators (? :)          - requires PS 7.0+
+    No ::new() constructors             - requires PS 5.0+
+    No [ordered]@{}                     - requires PS 3.0+; using OrderedDictionary
+    No -in operator                     - requires PS 3.0+; using -contains
+    No IsNullOrWhiteSpace               - using .Trim() -eq '' instead
+    No default parameter values needing PSv3 - all defaults explicit
+#>
+
+[CmdletBinding()]
+param (
+    [string]$Domain = $env:USERDNSDOMAIN
+)
+
+Set-StrictMode -Off   # Keep off so missing hash keys return $null gracefully
+
+# =============================================================================
+# SECTION 1 — Interactive save-path prompt
+# =============================================================================
+$DefaultTimestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$DefaultFileName  = "GPO_DefenderPolicies_Report_$DefaultTimestamp.csv"
+$DefaultSavePath  = Join-Path ([Environment]::GetFolderPath('Desktop')) $DefaultFileName
+
+Write-Host ''
+Write-Host '=================================================================' -ForegroundColor Cyan
+Write-Host '   GPO Microsoft Defender & MDE Policy Scanner                   ' -ForegroundColor Cyan
+Write-Host '=================================================================' -ForegroundColor Cyan
+Write-Host ''
+Write-Host '  Enter the full path where the CSV report should be saved.' -ForegroundColor White
+Write-Host '  Press ENTER to accept the default path shown below.'       -ForegroundColor DarkGray
+Write-Host ''
+Write-Host "  Default: $DefaultSavePath" -ForegroundColor DarkGray
+Write-Host ''
+
+$OutputCSV = $null
+while ($null -eq $OutputCSV) {
+
+    $RawInput = Read-Host '  Save report to'
+
+    # PS 3.0-safe blank check (avoids IsNullOrWhiteSpace)
+    if (($null -eq $RawInput) -or ($RawInput.Trim() -eq '')) {
+        $RawInput = $DefaultSavePath
+    }
+
+    # Ensure .csv extension
+    if ($RawInput -notmatch '\.csv$') {
+        $RawInput = $RawInput.TrimEnd('\', '/') + "\$DefaultFileName"
+        Write-Host "  No filename specified - using: $RawInput" -ForegroundColor DarkGray
+    }
+
+    # Validate parent directory
+    $ParentDir = Split-Path -Path $RawInput -Parent
+    if (-not (Test-Path -Path $ParentDir -PathType Container)) {
+        Write-Host ''
+        Write-Host "  Directory does not exist: $ParentDir" -ForegroundColor Yellow
+        $CreateDir = Read-Host '  Create it now? (Y/N)'
+        if ($CreateDir -match '^[Yy]') {
+            try {
+                New-Item -ItemType Directory -Path $ParentDir -Force | Out-Null
+                Write-Host '  Directory created.' -ForegroundColor Green
+            }
+            catch {
+                Write-Host "  ERROR: Could not create directory. $_" -ForegroundColor Red
+                Write-Host '  Please enter a different path.' -ForegroundColor Yellow
+                Write-Host ''
+                continue
+            }
+        }
+        else {
+            Write-Host '  Please enter a different path.' -ForegroundColor Yellow
+            Write-Host ''
+            continue
+        }
+    }
+
+    # Test write access
+    $TestFile = Join-Path $ParentDir "write_test_$DefaultTimestamp.tmp"
+    try {
+        [System.IO.File]::WriteAllText($TestFile, 'test')
+        Remove-Item $TestFile -ErrorAction SilentlyContinue
+        $OutputCSV = $RawInput
+    }
+    catch {
+        Write-Host '  ERROR: Cannot write to that location. Check permissions and try again.' -ForegroundColor Red
+        Write-Host ''
+    }
+}
+
+Write-Host ''
+Write-Host '  Report will be saved to:' -ForegroundColor White
+Write-Host "  $OutputCSV"               -ForegroundColor Green
+Write-Host ''
+
+# =============================================================================
+# SECTION 2 — Policy definition table
+#
+# Each entry is a hashtable with:
+#   Group       - Display group name
+#   Policy      - Human-readable policy name
+#   RegKey      - Full registry key path (HKLM\...)
+#   ValueName   - Registry value name  ($null = enumerate all values under key)
+#   Kind        - 'DisableFlag' | 'EnableFlag' | 'Numeric' | 'String' | 'MultiEnum'
+#
+# Kind controls how the value is interpreted for the Status column:
+#   DisableFlag  : DWord where 0 = protection ON, 1 = protection OFF
+#   EnableFlag   : DWord where 1 (or 2) = enabled, 0 = disabled/off
+#   Numeric      : DWord with a meaningful numeric value (shown as-is with label)
+#   String       : REG_SZ / REG_EXPAND_SZ (non-empty = configured)
+#   MultiEnum    : Enumerate all named values under the key (Exclusions, ASR)
+# =============================================================================
+
+# Base paths — stored as variables to keep entries readable
+$WD      = 'HKLM\SOFTWARE\Policies\Microsoft\Windows Defender'
+$RTP     = 'HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection'
+$Spynet  = 'HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Spynet'
+$MpEng   = 'HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\MpEngine'
+$Scan    = 'HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Scan'
+$ExclP   = 'HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Exclusions\Paths'
+$ExclE   = 'HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Exclusions\Extensions'
+$ExclPr  = 'HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Exclusions\Processes'
+$ASR     = 'HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\ASR\Rules'
+$CFA     = 'HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\Controlled Folder Access'
+$NetProt = 'HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\Network Protection'
+$MDE     = 'HKLM\SOFTWARE\Policies\Microsoft\Windows Advanced Threat Protection'
+$FWDom   = 'HKLM\SOFTWARE\Policies\Microsoft\WindowsFirewall\DomainProfile'
+$FWPri   = 'HKLM\SOFTWARE\Policies\Microsoft\WindowsFirewall\PrivateProfile'
+$FWPub   = 'HKLM\SOFTWARE\Policies\Microsoft\WindowsFirewall\PublicProfile'
+$SS      = 'HKLM\SOFTWARE\Policies\Microsoft\Windows\System'
+$DevGrd  = 'HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard'
+
+# Label maps for Numeric-kind policies
+$SpynetLabels = @{
+    0 = 'Disabled (MAPS off)'
+    1 = 'Basic MAPS membership'
+    2 = 'Advanced MAPS membership'
+}
+$BlockLevelLabels = @{
+    0 = 'Default'
+    2 = 'High'
+    4 = 'High-Plus'
+    6 = 'Zero-Tolerance'
+}
+$CFALabels = @{
+    0 = 'Disabled'
+    1 = 'Enabled (Block mode)'
+    2 = 'Audit mode'
+}
+$NetProtLabels = @{
+    0 = 'Disabled'
+    1 = 'Enabled (Block mode)'
+    2 = 'Audit mode'
+}
+$ASRLabels = @{
+    0 = 'Disabled'
+    1 = 'Block mode'
+    2 = 'Audit mode'
+}
+$ASRRuleNames = @{
+    'D4F940AB-401B-4EFC-AADC-AD5F3C50688A' = 'Block Office child processes'
+    '9E6C4E1F-7D60-472F-BA1A-A39EF669E4B2' = 'Block credential theft from LSASS'
+    '3B576869-A4EC-4529-8536-B80A7769E899' = 'Block executable content creation (Office)'
+    'D3E037E1-3EB8-44C8-A917-57927947596D' = 'Block JS/VBS from launching executables'
+    'BE9BA2D9-53EA-4CDC-84E5-9B1EEEE46550' = 'Block executable content from email/webmail'
+    'B2B3F03D-6A65-4F7B-A9C7-1C7EF74A9BA4' = 'Block untrusted/unsigned USB processes'
+    '26190899-1602-49E8-8B27-EB1D0A1CE869' = 'Block Office communication app child processes'
+    '7674BA52-37EB-4A4F-A9A1-F0F9A1619A2C' = 'Block Adobe Reader from creating child processes'
+    '92E97FA1-2EDF-4476-BDD6-9DD0B4DDDC7B' = 'Block Win32 API calls from Office macros'
+    '01443614-CD74-433A-B99E-2ECDC07BFC25' = 'Block executable files (untrusted/low prevalence)'
+    '5BEB7EFE-FD9A-4556-801D-275E5FFC04CC' = 'Block execution from obfuscated scripts'
+    'E6DB77E5-3DF2-4CF1-B95A-636979351E5B' = 'Block persistence via WMI event subscription'
+    '75668C1F-73B5-4CF0-BB93-3ECF5CB7CC84' = 'Block Office from injecting into other processes'
+    'C1DB55AB-C21A-4637-BB3F-A12568109D35' = 'Block process creation from PSExec/WMI'
+    'D1E49AAC-8F56-4280-B9BA-993A6D77406C' = 'Block process injections from Office macros'
+    'A8F5898E-1DC8-49A9-9878-85004B8A61E6' = 'Block Webshell creation for servers'
+    '56A863A9-875E-4185-98A7-B882C64B5CE5' = 'Block abuse of exploited vulnerable signed drivers'
+    '33DDEDF1-C6E0-47CB-833E-DE6133960387' = 'Block rebooting machine in Safe Mode'
+    'C0033C00-D16D-4114-A5A0-DC9B3A7D2CEB' = 'Block use of copied/impersonated system tools'
+}
+
+# --- Policy table (array of hashtables) ---
+# Using @() array with explicit hashtables — PS 2.0+ compatible
+$PolicyTable = @(
+
+    # ── Real-Time Protection ──────────────────────────────────────────────────
+    @{ Group='Real-Time Protection'; Policy='Turn on real-time protection';          RegKey=$RTP;    ValueName='DisableRealtimeMonitoring';    Kind='DisableFlag' }
+    @{ Group='Real-Time Protection'; Policy='Turn on behavior monitoring';           RegKey=$RTP;    ValueName='DisableBehaviorMonitoring';    Kind='DisableFlag' }
+    @{ Group='Real-Time Protection'; Policy='Scan all downloaded files';             RegKey=$RTP;    ValueName='DisableIOAVProtection';        Kind='DisableFlag' }
+    @{ Group='Real-Time Protection'; Policy='Monitor file and program activity';     RegKey=$RTP;    ValueName='DisableOnAccessProtection';    Kind='DisableFlag' }
+    @{ Group='Real-Time Protection'; Policy='Turn on process scanning';              RegKey=$RTP;    ValueName='DisableProcessScan';           Kind='DisableFlag' }
+    @{ Group='Real-Time Protection'; Policy='Turn on script scanning';               RegKey=$RTP;    ValueName='DisableScriptScanning';        Kind='DisableFlag' }
+
+    # ── Cloud Protection / MAPS ───────────────────────────────────────────────
+    @{ Group='Cloud Protection / MAPS'; Policy='Join Microsoft MAPS';               RegKey=$Spynet; ValueName='SpynetReporting';             Kind='Numeric';    Labels=$SpynetLabels }
+    @{ Group='Cloud Protection / MAPS'; Policy='Send file samples to Microsoft';    RegKey=$Spynet; ValueName='SubmitSamplesConsent';         Kind='Numeric';    Labels=@{0='Never';1='Always prompt';2='Send safe samples';3='Send all samples'} }
+    @{ Group='Cloud Protection / MAPS'; Policy='Cloud block level';                 RegKey=$MpEng;  ValueName='MpCloudBlockLevel';            Kind='Numeric';    Labels=$BlockLevelLabels }
+    @{ Group='Cloud Protection / MAPS'; Policy='Cloud extended timeout (seconds)';  RegKey=$MpEng;  ValueName='CloudExtendedTimeout';         Kind='Numeric';    Labels=@{} }
+
+    # ── Scanning ──────────────────────────────────────────────────────────────
+    @{ Group='Scanning'; Policy='Check for latest definitions before scan';         RegKey=$Scan;   ValueName='CheckForSignaturesBeforeRunningScan'; Kind='EnableFlag' }
+    @{ Group='Scanning'; Policy='Scan archive files';                               RegKey=$Scan;   ValueName='DisableArchiveScanning';       Kind='DisableFlag' }
+    @{ Group='Scanning'; Policy='Scan packed executables';                          RegKey=$Scan;   ValueName='DisablePackedExeScanning';     Kind='DisableFlag' }
+    @{ Group='Scanning'; Policy='Scan removable drives';                            RegKey=$Scan;   ValueName='DisableRemovableDriveScanning';Kind='DisableFlag' }
+    @{ Group='Scanning'; Policy='Scan network files';                               RegKey=$Scan;   ValueName='DisableScanningNetworkFiles';  Kind='DisableFlag' }
+    @{ Group='Scanning'; Policy='Turn on email scanning';                           RegKey=$Scan;   ValueName='DisableEmailScanning';         Kind='DisableFlag' }
+
+    # ── Exclusions (multi-value key enumeration) ──────────────────────────────
+    @{ Group='Exclusions'; Policy='Excluded file paths';                            RegKey=$ExclP;  ValueName=$null; Kind='MultiEnum' }
+    @{ Group='Exclusions'; Policy='Excluded file extensions';                       RegKey=$ExclE;  ValueName=$null; Kind='MultiEnum' }
+    @{ Group='Exclusions'; Policy='Excluded processes';                             RegKey=$ExclPr; ValueName=$null; Kind='MultiEnum' }
+
+    # ── ASR Rules (multi-value key enumeration) ───────────────────────────────
+    @{ Group='ASR Rules'; Policy='ASR Rules (all configured)';                      RegKey=$ASR;    ValueName=$null; Kind='MultiEnum' }
+
+    # ── Controlled Folder Access ──────────────────────────────────────────────
+    @{ Group='Controlled Folder Access'; Policy='Configure Controlled Folder Access'; RegKey=$CFA;  ValueName='EnableControlledFolderAccess'; Kind='Numeric'; Labels=$CFALabels }
+
+    # ── Network Protection ────────────────────────────────────────────────────
+    @{ Group='Network Protection'; Policy='Enable network protection';              RegKey=$NetProt; ValueName='EnableNetworkProtection';     Kind='Numeric'; Labels=$NetProtLabels }
+
+    # ── MDE Onboarding ────────────────────────────────────────────────────────
+    @{ Group='MDE Onboarding'; Policy='Endpoint onboarding state';                  RegKey=$MDE;    ValueName='OnboardingState';              Kind='Numeric'; Labels=@{1='Onboarded';0='Not onboarded'} }
+    @{ Group='MDE Onboarding'; Policy='Endpoint offboarding state';                 RegKey=$MDE;    ValueName='OffboardingState';             Kind='Numeric'; Labels=@{1='Offboarded';0='Not offboarded'} }
+
+    # ── MDE EDR / Sense ───────────────────────────────────────────────────────
+    @{ Group='MDE EDR'; Policy='Cloud service connectivity (Sense)';                RegKey=$MDE;    ValueName='SenseCloudEnabled';            Kind='EnableFlag' }
+    @{ Group='MDE EDR'; Policy='Telemetry / diagnostic data level';                 RegKey=$MDE;    ValueName='SenseTelemetryLevel';          Kind='Numeric'; Labels=@{0='Security';1='Basic';2='Enhanced';3='Full'} }
+
+    # ── Windows Defender Firewall ─────────────────────────────────────────────
+    @{ Group='Firewall'; Policy='Firewall enabled - Domain profile';                RegKey=$FWDom;  ValueName='EnableFirewall';               Kind='EnableFlag' }
+    @{ Group='Firewall'; Policy='Firewall enabled - Private profile';               RegKey=$FWPri;  ValueName='EnableFirewall';               Kind='EnableFlag' }
+    @{ Group='Firewall'; Policy='Firewall enabled - Public profile';                RegKey=$FWPub;  ValueName='EnableFirewall';               Kind='EnableFlag' }
+    @{ Group='Firewall'; Policy='Log dropped packets - Domain profile';             RegKey=$FWDom;  ValueName='LogDroppedPackets';            Kind='EnableFlag' }
+    @{ Group='Firewall'; Policy='Log dropped packets - Private profile';            RegKey=$FWPri;  ValueName='LogDroppedPackets';            Kind='EnableFlag' }
+    @{ Group='Firewall'; Policy='Log dropped packets - Public profile';             RegKey=$FWPub;  ValueName='LogDroppedPackets';            Kind='EnableFlag' }
+    @{ Group='Firewall'; Policy='Log successful connections - Domain profile';      RegKey=$FWDom;  ValueName='LogSuccessfulConnections';     Kind='EnableFlag' }
+    @{ Group='Firewall'; Policy='Log successful connections - Private profile';     RegKey=$FWPri;  ValueName='LogSuccessfulConnections';     Kind='EnableFlag' }
+    @{ Group='Firewall'; Policy='Log successful connections - Public profile';      RegKey=$FWPub;  ValueName='LogSuccessfulConnections';     Kind='EnableFlag' }
+
+    # ── SmartScreen ───────────────────────────────────────────────────────────
+    @{ Group='SmartScreen'; Policy='Enable SmartScreen (File Explorer / OS)';       RegKey=$SS;     ValueName='EnableSmartScreen';            Kind='EnableFlag' }
+    @{ Group='SmartScreen'; Policy='Enable SmartScreen for Microsoft Edge';         RegKey='HKLM\SOFTWARE\Policies\Microsoft\Edge'; ValueName='SmartScreenEnabled'; Kind='EnableFlag' }
+
+    # ── Credential Guard / Device Guard ───────────────────────────────────────
+    @{ Group='Device Guard'; Policy='Enable Virtualization-Based Security (VBS)';   RegKey=$DevGrd; ValueName='EnableVirtualizationBasedSecurity';   Kind='EnableFlag' }
+    @{ Group='Device Guard'; Policy='VBS platform security features required';      RegKey=$DevGrd; ValueName='RequirePlatformSecurityFeatures';      Kind='Numeric'; Labels=@{1='Secure Boot';3='Secure Boot + DMA Protection'} }
+    @{ Group='Device Guard'; Policy='Credential Guard configuration';               RegKey=$DevGrd; ValueName='LsaCfgFlags';                          Kind='Numeric'; Labels=@{0='Disabled';1='Enabled with UEFI lock';2='Enabled without lock'} }
+)
+
+# =============================================================================
+# SECTION 3 — Helper functions
+# =============================================================================
+function Write-Status {
+    param(
+        [string]$GPOName,
+        [string]$Status,
+        [string]$Detail
+    )
+    if ($null -eq $Detail) { $Detail = '' }
+    $Colour = switch ($Status) {
+        'Scanning'   { 'Cyan'     }
+        'Found'      { 'Green'    }
+        'Not Found'  { 'DarkGray' }
+        'Error'      { 'Red'      }
+        default      { 'White'    }
+    }
+    $Line = '[{0}]  GPO: {1}' -f $Status.PadRight(10), $GPOName
+    if ($Detail -ne '') { $Line += "  |  $Detail" }
+    Write-Host $Line -ForegroundColor $Colour
+}
+
+# Determine the Status string for a single-value (non-MultiEnum) policy hit
+function Get-PolicyStatus {
+    param(
+        [hashtable]$PolicyDef,
+        $RawValue
+    )
+
+    $Kind = $PolicyDef['Kind']
+
+    if ($Kind -eq 'DisableFlag') {
+        $IntVal = [int]$RawValue
+        if ($IntVal -eq 0) {
+            return 'Enabled'           # GPO enforces protection ON
+        }
+        elseif ($IntVal -eq 1) {
+            return 'Enabled - Protection OFF'   # GPO turns OFF this protection
+        }
+        else {
+            return "Configured: $IntVal"
+        }
+    }
+
+    if ($Kind -eq 'EnableFlag') {
+        $IntVal = [int]$RawValue
+        if ($IntVal -eq 0) {
+            return 'Enabled - Blank'    # Policy key present but set to disabled
+        }
+        else {
+            return 'Enabled'
+        }
+    }
+
+    if ($Kind -eq 'Numeric') {
+        $IntVal = [int]$RawValue
+        $Labels = $PolicyDef['Labels']
+        if (($null -ne $Labels) -and ($Labels.ContainsKey($IntVal))) {
+            return "Configured: $($Labels[$IntVal])"
+        }
+        else {
+            if ($IntVal -eq 0) {
+                return 'Enabled - Blank'
+            }
+            return "Configured: $IntVal"
+        }
+    }
+
+    if ($Kind -eq 'String') {
+        $StrVal = [string]$RawValue
+        if ($StrVal.Trim() -eq '') {
+            return 'Enabled - Blank'
+        }
+        return "Configured: $StrVal"
+    }
+
+    return "Configured: $RawValue"
+}
+
+# =============================================================================
+# SECTION 4 — Load GPOs
+# =============================================================================
+Write-Host "Connecting to domain: $Domain" -ForegroundColor Yellow
+
+try {
+    $AllGPOs = Get-GPO -All -Domain $Domain | Sort-Object DisplayName
+}
+catch {
+    Write-Host 'ERROR: Could not retrieve GPOs. Ensure RSAT (Group Policy) is installed and you have domain access.' -ForegroundColor Red
+    Write-Host $_ -ForegroundColor Red
+    exit 1
+}
+
+Write-Host "Found $($AllGPOs.Count) GPO(s) | Scanning $($PolicyTable.Count) policy definitions..." -ForegroundColor Yellow
+Write-Host ''
+Write-Host ('{0,-12}  {1,-50}  {2}' -f 'Status', 'GPO Name', 'Detail') -ForegroundColor White
+Write-Host ('-' * 115) -ForegroundColor DarkGray
+
+# =============================================================================
+# SECTION 5 — Scan loop
+# =============================================================================
+# New-Object replaces ::new() — PS 2.0+ compatible
+$Results = New-Object System.Collections.Generic.List[PSCustomObject]
+
+foreach ($GPO in $AllGPOs) {
+    $GPOName    = $GPO.DisplayName
+    $FoundInGPO = $false
+
+    Write-Status -GPOName $GPOName -Status 'Scanning'
+
+    foreach ($PolicyDef in $PolicyTable) {
+        $Group      = $PolicyDef['Group']
+        $PolicyName = $PolicyDef['Policy']
+        $RegKey     = $PolicyDef['RegKey']
+        $ValueName  = $PolicyDef['ValueName']
+        $Kind       = $PolicyDef['Kind']
+
+        # ── MultiEnum: enumerate all values under the key ─────────────────────
+        if ($Kind -eq 'MultiEnum') {
+            try {
+                # Get-GPRegistryValue without -ValueName returns all values under key
+                $AllValues = Get-GPRegistryValue `
+                    -Guid   $GPO.Id `
+                    -Domain $Domain `
+                    -Key    $RegKey `
+                    -ErrorAction Stop
+
+                if ($null -ne $AllValues) {
+                    foreach ($RegVal in $AllValues) {
+                        # Skip the default (empty-name) value
+                        if (($null -eq $RegVal.ValueName) -or ($RegVal.ValueName.Trim() -eq '')) {
+                            continue
+                        }
+
+                        $RawVal    = $RegVal.Value
+                        $ValName   = $RegVal.ValueName
+
+                        # Determine status based on group type
+                        $StatusStr = ''
+
+                        if ($Group -eq 'ASR Rules') {
+                            $IntVal = [int]$RawVal
+                            if ($IntVal -eq 0) {
+                                continue   # ASR rule is off — skip
+                            }
+                            if ($ASRLabels.ContainsKey($IntVal)) {
+                                $ModeLabel = $ASRLabels[$IntVal]
+                            }
+                            else {
+                                $ModeLabel = "Value $IntVal"
+                            }
+                            # Resolve GUID to friendly name if known
+                            $GuidUpper = $ValName.ToUpper().Trim('{}')
+                            if ($ASRRuleNames.ContainsKey($GuidUpper)) {
+                                $RuleFriendly = $ASRRuleNames[$GuidUpper]
+                            }
+                            else {
+                                $RuleFriendly = $ValName
+                            }
+                            $PolicyName  = "ASR: $RuleFriendly"
+                            $StatusStr   = "Enabled - $ModeLabel"
+                        }
+                        else {
+                            # Exclusions — any entry present = configured
+                            $StrVal = [string]$RawVal
+                            if ($StrVal.Trim() -eq '0') {
+                                $StatusStr = 'Configured'
+                            }
+                            elseif ($StrVal.Trim() -eq '') {
+                                $StatusStr = 'Enabled - Blank'
+                            }
+                            else {
+                                $StatusStr = "Configured: $StrVal"
+                            }
+                            $PolicyName = "$($PolicyDef['Policy']): $ValName"
+                        }
+
+                        $FoundInGPO = $true
+                        Write-Status -GPOName $GPOName -Status 'Found' `
+                            -Detail "$Group | $PolicyName | $StatusStr"
+
+                        $Results.Add([PSCustomObject]@{
+                            GPOName    = $GPOName
+                            GPOID      = $GPO.Id.ToString()
+                            Group      = $Group
+                            Policy     = $PolicyName
+                            Status     = $StatusStr
+                            RegKey     = $RegKey
+                            ValueName  = $ValName
+                            Timestamp  = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+                        })
+                    }
+                }
+            }
+            catch [System.ArgumentException] {
+                # Key not present in this GPO — expected
+            }
+            catch {
+                Write-Status -GPOName $GPOName -Status 'Error' `
+                    -Detail "[$Group / $PolicyName] $($_.Exception.Message)"
+            }
+            continue   # Move to next policy definition
+        }
+
+        # ── Single-value lookup ───────────────────────────────────────────────
+        try {
+            $RegResult = Get-GPRegistryValue `
+                -Guid        $GPO.Id `
+                -Domain      $Domain `
+                -Key         $RegKey `
+                -ValueName   $ValueName `
+                -ErrorAction Stop
+
+            $RawValue  = $RegResult.Value
+            $StatusStr = Get-PolicyStatus -PolicyDef $PolicyDef -RawValue $RawValue
+
+            $FoundInGPO = $true
+            Write-Status -GPOName $GPOName -Status 'Found' `
+                -Detail "$Group | $PolicyName | $StatusStr"
+
+            $Results.Add([PSCustomObject]@{
+                GPOName    = $GPOName
+                GPOID      = $GPO.Id.ToString()
+                Group      = $Group
+                Policy     = $PolicyName
+                Status     = $StatusStr
+                RegKey     = $RegKey
+                ValueName  = $ValueName
+                Timestamp  = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+            })
+        }
+        catch [System.ArgumentException] {
+            # Value not present in this GPO — expected, skip silently
+        }
+        catch {
+            Write-Status -GPOName $GPOName -Status 'Error' `
+                -Detail "[$Group / $PolicyName] $($_.Exception.Message)"
+        }
+    }
+
+    if (-not $FoundInGPO) {
+        Write-Status -GPOName $GPOName -Status 'Not Found'
+    }
+}
+
+Write-Host ('-' * 115) -ForegroundColor DarkGray
+
+# =============================================================================
+# SECTION 6 — Write CSV and summary
+# =============================================================================
+if ($Results.Count -gt 0) {
+    try {
+        $Results | Export-Csv -Path $OutputCSV -NoTypeInformation -Encoding UTF8
+
+        Write-Host ''
+        Write-Host "Scan complete. $($Results.Count) configured Defender/MDE setting(s) found across GPOs." -ForegroundColor Green
+        Write-Host "CSV report saved to: $((Resolve-Path $OutputCSV).Path)" -ForegroundColor Green
+
+        Write-Host ''
+        Write-Host '-- Summary (grouped) --------------------------------------------------------' -ForegroundColor Yellow
+
+        # Group summary by Group name — PS 2.0+ compatible (no Group-Object -NoElement)
+        $GroupSummary = @{}
+        foreach ($Row in $Results) {
+            $G = $Row.Group
+            if ($GroupSummary.ContainsKey($G)) {
+                $GroupSummary[$G]++
+            }
+            else {
+                $GroupSummary[$G] = 1
+            }
+        }
+        foreach ($G in ($GroupSummary.Keys | Sort-Object)) {
+            Write-Host ("  {0,-45} {1} setting(s)" -f $G, $GroupSummary[$G]) -ForegroundColor White
+        }
+
+        Write-Host ''
+        $Results | Format-Table -AutoSize GPOName, Group, Policy, Status
+    }
+    catch {
+        Write-Host ''
+        Write-Host "ERROR: Could not write CSV to '$OutputCSV'." -ForegroundColor Red
+        Write-Host $_ -ForegroundColor Red
+    }
+}
+else {
+    Write-Host ''
+    Write-Host 'Scan complete. No configured Microsoft Defender or MDE policy settings were found in any GPO.' -ForegroundColor Yellow
+    Write-Host 'No CSV file created (nothing to report).' -ForegroundColor Yellow
+}
+
+Write-Host ''
